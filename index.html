@@ -1,0 +1,1073 @@
+<title>Dice Brawl</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+  /* Single deliberate dark look: pixel-art arcade screen, same in every theme */
+  :root { --bg:#0d0e18; color-scheme:dark; background:var(--bg); height:100%; box-sizing:border-box; }
+  body { margin:0; height:100%; background:var(--bg); overflow:hidden;
+         display:flex; align-items:center; justify-content:center; }
+  canvas { display:block; image-rendering:pixelated; image-rendering:crisp-edges; touch-action:none; }
+</style>
+<canvas id="c" width="400" height="240"></canvas>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/matter-js/0.19.0/matter.min.js"></script>
+<script>
+(() => {
+'use strict';
+const { Engine, Bodies, Body, Composite, Events } = Matter;
+
+// ============================================================
+// CONFIG & DATA
+// ============================================================
+const W = 400, H = 240;
+const FONT = '"Press Start 2P", monospace';
+const STEP = 1000 / 60;
+
+const C = {
+  ink:'#1a1c2c', plum:'#5d275d', red:'#b13e53', orange:'#ef7d57', yellow:'#ffcd75',
+  lime:'#a7f070', green:'#38b764', teal:'#257179', navy:'#29366f', blue:'#3b5dc9',
+  sky:'#41a6f6', cyan:'#73eff7', white:'#f4f4f4', silver:'#94b0c2', gray:'#566c86',
+  slate:'#333c57', wood:'#8b5a3c', woodD:'#5a3825', felt:'#2b4a3a', feltL:'#35593f', feltD:'#223b2e'
+};
+
+const PANEL_W = 110;
+const TB = { x:118, y:10, w:272, h:220 };          // inner table rect
+const TB_R = TB.x + TB.w, TB_B = TB.y + TB.h;
+const LAUNCH_Y = 194;                               // launch area: LAUNCH_Y..TB_B
+const ENEMY = { x:55, y:54 };                       // enemy centre (damage target)
+const TRAY = { x:5, y:176, slot:20, h:26 };
+
+const CONFIG = {
+  enemyHp: 60, playerHp: 25,
+  enemyDmg: [3, 6],
+  throwK: 0.7,          // pointer px/ms -> body px/step
+  maxSpeed: 12,         // cap on throw speed (px/step)
+  gentle: 1.6,          // slower release = reposition, no throw
+  maxDice: 4,
+  stars: [6, 9],        // <=6 throws: 3 stars, <=9: 2 stars
+};
+
+const DICE = [
+  { name:'d4',  n:4,  shape:3,    r:9,  dens:0.004,  air:0.03,  decel:0.11,  rest:0.25, cd:0, col:C.green  },
+  { name:'d6',  n:6,  shape:'sq', r:9,  dens:0.002,  air:0.02,  decel:0.07,  rest:0.45, cd:0, col:C.white  },
+  { name:'d8',  n:8,  shape:'rh', r:10, dens:0.002,  air:0.018, decel:0.06,  rest:0.5,  cd:1, col:C.sky    },
+  { name:'d12', n:12, shape:5,    r:9,  dens:0.0015, air:0.014, decel:0.045, rest:0.65, cd:2, col:C.orange },
+  { name:'d20', n:20, shape:6,    r:9,  dens:0.0012, air:0.01,  decel:0.035, rest:0.75, cd:3, col:C.yellow },
+];
+
+const ZONE_TYPES = {
+  X2:   { label:'x2',    fill:'#8a6424', light:C.yellow, w:1,   desc:'Damage x2',
+          apply:v => ({ v:v * 2, s:'x2' }) },
+  P2:   { label:'+2',    fill:'#24663c', light:C.lime,   w:1.2, desc:'Damage +2',
+          apply:v => ({ v:v + 2, s:'+2' }) },
+  M2:   { label:'-2',    fill:'#6e2436', light:C.orange, w:1,   desc:'Damage -2',
+          apply:v => ({ v:Math.max(0, v - 2), s:'-2' }) },
+  INV:  { label:'INV',   fill:'#1b4f66', light:C.cyan,   w:0.8, desc:'Invert face',
+          apply:(v, n) => ({ v:Math.max(0, n + 1 - v), s:'INV' }) },
+  VOID: { label:'VOID', fill:'#0d0e18', light:C.gray,   w:0.7, desc:'No damage',
+          apply:() => ({ v:0, s:'x0' }) },
+  BIS:  { label:'ROLL+',   fill:'#2f3590', light:C.sky,    w:0.6, desc:'Reroll + add',
+          apply:(v, n) => { const e = ri(1, n); return { v:v + e, s:'+' + e }; } },
+};
+
+const OBS_SET = ['pillar', 'pillar', 'bumper', 'bumper', 'rune', 'spikes', 'crystal'];
+const OBS_DESC = {
+  bumper:'Push', rune:'+1 to die', spikes:'-1 to die', crystal:'Clones die', pillar:'Bounce'
+};
+
+// ============================================================
+// HELPERS
+// ============================================================
+const rnd = (a, b) => a + Math.random() * (b - a);
+const ri = (a, b) => Math.floor(rnd(a, b + 1));
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const inRect = (p, r) => p.x >= r.x && p.x < r.x + r.w && p.y >= r.y && p.y < r.y + r.h;
+function pickW(items, wf) {
+  const tot = items.reduce((s, it) => s + wf(it), 0);
+  let r = Math.random() * tot;
+  for (const it of items) { r -= wf(it); if (r <= 0) return it; }
+  return items[items.length - 1];
+}
+
+// ============================================================
+// CANVAS & PIXEL DRAWING
+// ============================================================
+const cv = document.getElementById('c');
+const ctx = cv.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+
+function resize() {
+  const s = Math.min(document.body.clientWidth / W, document.body.clientHeight / H);
+  const k = s >= 1 ? Math.floor(s) : s;
+  cv.style.width = W * k + 'px';
+  cv.style.height = H * k + 'px';
+}
+addEventListener('resize', resize);
+resize();
+
+// Scanline polygon fill -> crisp pixels, no anti-aliasing
+function pixPoly(vs, col, g = ctx) {
+  let minY = Infinity, maxY = -Infinity;
+  for (const v of vs) { minY = Math.min(minY, v.y); maxY = Math.max(maxY, v.y); }
+  g.fillStyle = col;
+  const n = vs.length;
+  for (let y = Math.floor(minY); y <= Math.ceil(maxY); y++) {
+    const sy = y + 0.5, xs = [];
+    for (let i = 0; i < n; i++) {
+      const a = vs[i], b = vs[(i + 1) % n];
+      if ((a.y <= sy && b.y > sy) || (b.y <= sy && a.y > sy))
+        xs.push(a.x + (sy - a.y) / (b.y - a.y) * (b.x - a.x));
+    }
+    xs.sort((p, q) => p - q);
+    for (let k = 0; k + 1 < xs.length; k += 2) {
+      const x0 = Math.round(xs[k]), x1 = Math.round(xs[k + 1]);
+      if (x1 > x0) g.fillRect(x0, y, x1 - x0, 1);
+    }
+  }
+}
+function shrink(vs, d) {
+  let cx = 0, cy = 0;
+  for (const v of vs) { cx += v.x; cy += v.y; }
+  cx /= vs.length; cy /= vs.length;
+  const k = d / Math.cos(Math.PI / vs.length);
+  return vs.map(v => {
+    const dx = cx - v.x, dy = cy - v.y, l = Math.hypot(dx, dy) || 1;
+    return { x:v.x + dx / l * k, y:v.y + dy / l * k };
+  });
+}
+function pixCircle(cx, cy, r, col) {
+  ctx.fillStyle = col;
+  cx = Math.round(cx); cy = Math.round(cy);
+  for (let dy = -r; dy < r; dy++) {
+    const yy = dy + 0.5, hw = Math.round(Math.sqrt(Math.max(0, r * r - yy * yy)));
+    if (hw > 0) ctx.fillRect(cx - hw, cy + dy, hw * 2, 1);
+  }
+}
+function text(s, x, y, col, size = 8, align = 'left', shadow = true) {
+  ctx.font = size + 'px ' + FONT;
+  ctx.textAlign = align; ctx.textBaseline = 'top';
+  x = Math.round(x); y = Math.round(y);
+  if (shadow) { ctx.fillStyle = C.ink; ctx.fillText(s, x + 1, y + 1); }
+  ctx.fillStyle = col; ctx.fillText(s, x, y);
+}
+
+// Tiny 3x5 font for numbers on dice
+const TINY = {
+  '0':'111101101101111', '1':'010110010010111', '2':'111001111100111', '3':'111001111001111',
+  '4':'101101111001001', '5':'111100111001111', '6':'111100111101111', '7':'111001001001001',
+  '8':'111101111101111', '9':'111101111001111', '+':'000010111010000', '-':'000000111000000',
+};
+function tiny(s, cx, y, col, sc = 1) {
+  const w = s.length * 4 * sc - sc;
+  let x = Math.round(cx - w / 2); y = Math.round(y);
+  ctx.fillStyle = col;
+  for (const ch of s) {
+    const bm = TINY[ch];
+    if (bm) for (let i = 0; i < 15; i++)
+      if (bm[i] === '1') ctx.fillRect(x + (i % 3) * sc, y + Math.floor(i / 3) * sc, sc, sc);
+    x += 4 * sc;
+  }
+}
+
+// ============================================================
+// SPRITES
+// ============================================================
+const ENEMY_HALF = [            // left half, mirrored -> 20x20
+  '..k.......',
+  '..kk......',
+  '..kok.....',
+  '...kok....',
+  '...kkkkkkk',
+  '..khhhpppp',
+  '.khhpppppp',
+  '.khpkkkppp',
+  '.kppkwrkpp',
+  '.kppkkkppp',
+  '.kpppppppp',
+  '.kpppppppp',
+  '.kppkkkkkk',
+  '.kppkwkwkw',
+  '.kppkkkkkk',
+  '.kpppppppp',
+  '..kdpppppp',
+  '...kkkkkkk',
+  '...kdk....',
+  '...kkk....',
+];
+const ENEMY_PAL = { k:C.ink, o:C.silver, h:C.orange, p:C.red, d:C.plum, w:C.white, r:C.ink };
+function makeSprite(half, pal, sc, flat) {
+  const rows = half.map(h => h + [...h].reverse().join(''));
+  const c = document.createElement('canvas');
+  c.width = rows[0].length * sc; c.height = rows.length * sc;
+  const g = c.getContext('2d');
+  rows.forEach((row, y) => [...row].forEach((ch, x) => {
+    if (ch === '.') return;
+    g.fillStyle = flat || pal[ch];
+    g.fillRect(x * sc, y * sc, sc, sc);
+  }));
+  return c;
+}
+const SPRITE = makeSprite(ENEMY_HALF, ENEMY_PAL, 3);
+const SPRITE_FLASH = makeSprite(ENEMY_HALF, ENEMY_PAL, 3, C.white);
+
+const STAR = [
+  '....#....', '...###...', '...###...', '#########', '.#######.',
+  '..#####..', '..##.##..', '.##...##.', '##.....##',
+];
+function drawStar(x, y, col, sc = 2) {
+  ctx.fillStyle = col;
+  STAR.forEach((row, j) => [...row].forEach((ch, i) => {
+    if (ch === '#') ctx.fillRect(x + i * sc, y + j * sc, sc, sc);
+  }));
+}
+
+// ============================================================
+// AUDIO (tiny synth blips)
+// ============================================================
+let actx = null;
+function ensureAudio() {
+  try {
+    if (!actx) actx = new (window.AudioContext || window.webkitAudioContext)();
+    else if (actx.state === 'suspended') actx.resume();
+  } catch (e) { actx = null; }
+}
+function beep(f, d, type = 'square', vol = 0.05, slide = 0) {
+  if (!actx) return;
+  const t = actx.currentTime, o = actx.createOscillator(), g = actx.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(f, t);
+  if (slide) o.frequency.exponentialRampToValueAtTime(Math.max(30, f * slide), t + d);
+  g.gain.setValueAtTime(vol, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + d);
+  o.connect(g).connect(actx.destination);
+  o.start(t); o.stop(t + d + 0.02);
+}
+const seq = (notes, gap, d, type = 'square', vol = 0.05) =>
+  notes.forEach((f, i) => setTimeout(() => beep(f, d, type, vol), i * gap));
+const SFX = {
+  click:   () => beep(440, .05, 'square', .04),
+  tick:    () => beep(180, .04, 'square', .025),
+  throw:   () => beep(260, .14, 'triangle', .06, 2.5),
+  bump:    () => beep(520, .12, 'square', .05, 2),
+  rune:    () => seq([880, 1320], 60, .1, 'triangle', .06),
+  spikes:  () => beep(150, .16, 'sawtooth', .05, .5),
+  crystal: () => seq([1200, 1600, 2000], 40, .08, 'triangle', .05),
+  pop:     () => beep(660, .06, 'square', .04),
+  calc:    () => beep(520, .05, 'square', .03),
+  hit:     () => { beep(110, .2, 'square', .08, .4); beep(70, .25, 'sawtooth', .05, .5); },
+  miss:    () => beep(200, .15, 'triangle', .05, .6),
+  hurt:    () => beep(170, .3, 'sawtooth', .07, .4),
+  shuffle: () => beep(240, .45, 'triangle', .05, 3),
+  win:     () => seq([523, 659, 784, 1047], 120, .18),
+  lose:    () => seq([392, 330, 262, 196], 160, .25),
+};
+function sfx(n) { try { SFX[n] && SFX[n](); } catch (e) { /* audio is optional */ } }
+
+// ============================================================
+// PHYSICS
+// ============================================================
+const engine = Engine.create({ enableSleeping:false });
+engine.gravity.x = 0; engine.gravity.y = 0;
+engine.positionIterations = 10;
+engine.velocityIterations = 8;
+const world = engine.world;
+
+const T = 60;
+const WALL_OPTS = { isStatic:true, label:'wall', restitution:0, friction:0 };
+const walls = [
+  Bodies.rectangle(TB.x + TB.w / 2, TB.y - T / 2, TB.w + T * 2, T, WALL_OPTS),
+  Bodies.rectangle(TB.x + TB.w / 2, TB_B + T / 2, TB.w + T * 2, T, WALL_OPTS),
+  Bodies.rectangle(TB.x - T / 2, TB.y + TB.h / 2, T, TB.h + T * 2, WALL_OPTS),
+  Bodies.rectangle(TB_R + T / 2, TB.y + TB.h / 2, T, TB.h + T * 2, WALL_OPTS),
+];
+
+function makeDieBody(type, x, y) {
+  const t = DICE[type];
+  const o = { restitution:t.rest, frictionAir:t.air, friction:0.02, density:t.dens, label:'die' };
+  if (t.shape === 'sq') return Bodies.rectangle(x, y, t.r * 1.4, t.r * 1.4, o);
+  if (t.shape === 'rh') return Bodies.fromVertices(x, y,
+    [[{ x:0, y:-t.r }, { x:t.r * 0.72, y:0 }, { x:0, y:t.r }, { x:-t.r * 0.72, y:0 }]], o);
+  return Bodies.polygon(x, y, t.shape, t.r, o);
+}
+DICE.forEach((t, i) => {
+  const b = makeDieBody(i, 0, 0);
+  t.tpl = b.vertices.map(v => ({ x:v.x - b.position.x, y:v.y - b.position.y }));
+});
+const tplAt = (type, x, y, s = 1) => DICE[type].tpl.map(v => ({ x:x + v.x * s, y:y + v.y * s }));
+
+function makeObstacle(kind, x, y) {
+  const o = { isStatic:true, label:'obs', restitution:0, friction:0 };
+  let body;
+  if (kind === 'pillar') body = Bodies.circle(x, y, 7, o);
+  else if (kind === 'bumper') body = Bodies.circle(x, y, 8, { ...o, restitution:1 });
+  else if (kind === 'rune' || kind === 'spikes') body = Bodies.rectangle(x, y, 13, 13, o);
+  else { body = Bodies.polygon(x, y, 4, 9, o); Body.setAngle(body, Math.PI / 4); }
+  const obs = { kind, x, y, body, flash:0, used:false };
+  body.obs = obs;
+  return obs;
+}
+
+const hits = [];
+let wallHit = false;
+Events.on(engine, 'collisionStart', ev => {
+  for (const p of ev.pairs) {
+    const a = p.bodyA.parent, b = p.bodyB.parent;
+    if (a.die && b.obs) hits.push([a.die, b.obs]);
+    else if (b.die && a.obs) hits.push([b.die, a.obs]);
+    else if ((a.die && b.label === 'wall') || (b.die && a.label === 'wall')) wallHit = true;
+    else if (a.die && b.die) wallHit = true;
+  }
+});
+
+// ============================================================
+// GAME STATE
+// ============================================================
+let state = 'menu';
+let time = 0, tasks = [];
+let enemy, player, throws, cooldowns, selected, zones, zoneLayer, zoneTrans, obstacles;
+let dice = [], particles = [], floats = [], flyers = [];
+let held, drag = null, aimVel = { x:0, y:0 };
+let logLines = [], shakeAmt = 0, redFlash = 0, rollSteps = 0, resolveTotal = 0;
+let pointer = { x:-1, y:-1 }, lastTick = 0, fontReady = false;
+
+const later = (s, fn) => tasks.push({ at:time + s, fn });
+const setLog = lines => { logLines = lines; };
+const shake = a => { shakeAmt = Math.max(shakeAmt, a); };
+const HELD_HOME = () => ({ x:TB.x + TB.w / 2, y:(LAUNCH_Y + TB_B) / 2 });
+const clampHeld = p => ({
+  x:clamp(p.x, TB.x + 10, TB_R - 10),
+  y:clamp(p.y, LAUNCH_Y + 9, TB_B - 9),
+});
+
+function newGame() {
+  Composite.clear(world, false);
+  Composite.add(world, walls);
+  enemy = { hp:CONFIG.enemyHp, max:CONFIG.enemyHp, disp:CONFIG.enemyHp, flash:0, lunge:0, dead:false, deadT:0 };
+  player = { hp:CONFIG.playerHp, max:CONFIG.playerHp, disp:CONFIG.playerHp, flash:0 };
+  throws = 0;
+  cooldowns = DICE.map(() => 0);
+  selected = 1;
+  dice = []; particles = []; floats = []; flyers = []; tasks = []; hits.length = 0;
+  obstacles = [];
+  zones = genZones(); zoneLayer = buildZoneLayer(zones); zoneTrans = null;
+  genObstacles();
+  held = HELD_HOME(); drag = null;
+  setLog(['DRAG A DIE', 'AND THROW', 'IT!']);
+  state = 'aim';
+}
+
+// ---------- Layout generation ----------
+// Obstacles must never cover a zone's label (centre area, inflated by obstacle size)
+const coversLabel = (z, x, y) =>
+  Math.abs(x - (z.x + z.w / 2)) < 32 && Math.abs(y - (z.y + z.h / 2)) < 16;
+function genZones() {
+  const res = [], counts = {}, keys = Object.keys(ZONE_TYPES);
+  let guard = 0;
+  while (res.length < 5 && guard++ < 800) {
+    const k = pickW(keys, k => ZONE_TYPES[k].w);
+    if ((counts[k] || 0) >= 2) continue;
+    const w = ri(46, 62), h = ri(28, 40);
+    const x = ri(TB.x + 4, TB_R - 4 - w), y = ri(TB.y + 4, LAUNCH_Y - 8 - h);
+    if (res.some(z => x < z.x + z.w + 6 && x + w + 6 > z.x && y < z.y + z.h + 6 && y + h + 6 > z.y)) continue;
+    if (guard < 600 && obstacles.some(o => !o.used && coversLabel({ x, y, w, h }, o.x, o.y))) continue;
+    res.push({ type:k, x, y, w, h });
+    counts[k] = (counts[k] || 0) + 1;
+  }
+  return res;
+}
+function genObstacles() {
+  for (const o of obstacles) if (!o.used) Composite.remove(world, o.body);
+  obstacles = [];
+  for (const kind of OBS_SET) {
+    for (let tries = 0; tries < 300; tries++) {
+      const x = ri(TB.x + 16, TB_R - 16), y = ri(TB.y + 16, LAUNCH_Y - 24);
+      if (obstacles.some(o => Math.hypot(o.x - x, o.y - y) < 34)) continue;
+      if (tries < 250 && zones.some(z => coversLabel(z, x, y))) continue;
+      const o = makeObstacle(kind, x, y);
+      obstacles.push(o);
+      Composite.add(world, o.body);
+      break;
+    }
+  }
+}
+const zoneAt = p => zones.find(z => p.x >= z.x && p.x < z.x + z.w && p.y >= z.y && p.y < z.y + z.h);
+
+function buildZoneLayer(zs) {
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const g = c.getContext('2d');
+  g.fillStyle = C.felt; g.fillRect(TB.x, TB.y, TB.w, TB.h);
+  g.fillStyle = C.feltL;
+  for (let y = TB.y; y < TB_B; y += 4)
+    for (let x = TB.x + ((y / 4) % 2 ? 2 : 0); x < TB_R; x += 4) g.fillRect(x, y, 1, 1);
+  // launch area
+  g.fillStyle = C.feltD; g.fillRect(TB.x, LAUNCH_Y, TB.w, TB_B - LAUNCH_Y);
+  g.fillStyle = C.feltL;
+  for (let x = TB.x; x < TB_R; x += 6) g.fillRect(x, LAUNCH_Y, 3, 1);
+  g.font = '8px ' + FONT; g.textBaseline = 'top'; g.textAlign = 'right';
+  g.fillStyle = C.feltL; g.fillText('LAUNCH', TB_R - 4, TB_B - 10);
+  // zones
+  for (const z of zs) {
+    const t = ZONE_TYPES[z.type];
+    g.fillStyle = t.fill; g.fillRect(z.x, z.y, z.w, z.h);
+    g.fillStyle = t.light;
+    for (let y = z.y + 2; y < z.y + z.h - 2; y += 3)
+      for (let x = z.x + 2 + (((y - z.y) / 3) % 2 ? 2 : 0); x < z.x + z.w - 2; x += 4)
+        if (Math.random() < 0.25) g.fillRect(x, y, 1, 1);
+    g.fillRect(z.x + 1, z.y, z.w - 2, 1); g.fillRect(z.x + 1, z.y + z.h - 1, z.w - 2, 1);
+    g.fillRect(z.x, z.y + 1, 1, z.h - 2); g.fillRect(z.x + z.w - 1, z.y + 1, 1, z.h - 2);
+    g.textAlign = 'center';
+    const tx = Math.round(z.x + z.w / 2), ty = Math.round(z.y + z.h / 2 - 4);
+    g.fillStyle = C.ink; g.fillText(t.label, tx + 1, ty + 1);
+    g.fillStyle = t.light; g.fillText(t.label, tx, ty);
+  }
+  return c;
+}
+
+// ---------- Dice ----------
+function spawnDie(type, x, y, vx, vy, w) {
+  const body = makeDieBody(type, x, y);
+  Body.setVelocity(body, { x:vx, y:vy });
+  Body.setAngularVelocity(body, w);
+  const d = { type, body, shown:ri(1, DICE[type].n), value:0, mod:0, hit:new Set(),
+              settled:false, still:0, accum:0, pop:0, calc:null, showCalc:false };
+  body.die = d;
+  Composite.add(world, body);
+  dice.push(d);
+  return d;
+}
+
+function throwDie(vx, vy) {
+  const sp = Math.hypot(vx, vy), k = Math.min(sp, CONFIG.maxSpeed) / sp;
+  vx *= k; vy *= k;
+  const s = sp * k;
+  spawnDie(selected, held.x, held.y, vx, vy, (Math.random() < 0.5 ? -1 : 1) * (0.08 + s * 0.025));
+  throws++;
+  cooldowns[selected] = DICE[selected].cd + 1;   // decremented at end of turn
+  state = 'rolling'; rollSteps = 0;
+  setLog(['THROW ' + throws, DICE[selected].name.toUpperCase() + '!']);
+  sfx('throw');
+}
+
+function settleDie(d) {
+  const t = DICE[d.type];
+  d.settled = true;
+  d.value = ri(1, t.n);
+  d.shown = d.value;
+  d.pop = 1;
+  Body.setVelocity(d.body, { x:0, y:0 });
+  Body.setAngularVelocity(d.body, 0);
+  Body.setStatic(d.body, true);
+  burst(d.body.position.x, d.body.position.y, t.col, 5, 1.2);
+  sfx('pop');
+}
+
+function processHits() {
+  for (const [d, o] of hits) {
+    if (d.settled) continue;
+    const b = d.body, pos = b.position, v = b.velocity;
+    o.flash = 0.2;
+    switch (o.kind) {
+      case 'bumper': {
+        const dx = pos.x - o.x, dy = pos.y - o.y, l = Math.hypot(dx, dy) || 1;
+        const s = Math.min(11, Math.max(Math.hypot(v.x, v.y) * 1.15, 7));
+        Body.setVelocity(b, { x:dx / l * s, y:dy / l * s });
+        burst(o.x, o.y, C.yellow, 6, 1.5);
+        sfx('bump'); shake(1);
+        break;
+      }
+      case 'rune':
+      case 'spikes': {
+        if (d.hit.has(o)) break;
+        d.hit.add(o);
+        const up = o.kind === 'rune';
+        if (up ? d.mod < 3 : d.mod > -3) {
+          d.mod += up ? 1 : -1;
+          addFloat(pos.x, pos.y - 12, up ? '+1' : '-1', up ? C.cyan : C.orange);
+        }
+        burst(o.x, o.y, up ? C.cyan : C.red, 6, 1.2);
+        sfx(up ? 'rune' : 'spikes');
+        break;
+      }
+      case 'crystal': {
+        if (o.used) break;
+        o.used = true;
+        Composite.remove(world, o.body);
+        burst(o.x, o.y, C.cyan, 14, 2);
+        burst(o.x, o.y, C.white, 6, 1.5);
+        sfx('crystal');
+        if (dice.length < CONFIG.maxDice) {
+          const s = Math.max(Math.hypot(v.x, v.y), 4);
+          const dir = Math.atan2(v.y, v.x) + (Math.random() < 0.5 ? -1 : 1) * rnd(0.7, 1.1);
+          spawnDie(d.type, o.x, o.y, Math.cos(dir) * s, Math.sin(dir) * s, rnd(-0.3, 0.3));
+          addFloat(o.x, o.y - 12, 'CLONE!', C.cyan);
+        }
+        break;
+      }
+      default:
+        burst(pos.x, pos.y, C.silver, 3, 1);
+        sfx('tick');
+    }
+  }
+  hits.length = 0;
+  if (wallHit && time - lastTick > 0.06) { sfx('tick'); lastTick = time; }
+  wallHit = false;
+}
+
+function physicsStep() {
+  for (const d of dice) {
+    if (d.settled) continue;
+    const b = d.body, v = b.velocity, s = Math.hypot(v.x, v.y), t = DICE[d.type];
+    if (s > 0) {                               // rolling resistance (constant decel)
+      const ns = Math.max(0, s - t.decel);
+      Body.setVelocity(b, { x:v.x / s * ns, y:v.y / s * ns });
+    }
+    Body.setAngularVelocity(b, b.angularVelocity * (s < 1 ? 0.88 : 0.985));
+  }
+  Engine.update(engine, STEP);
+  processHits();
+
+  for (const d of dice) {
+    if (d.settled) continue;
+    const v = d.body.velocity, s = Math.hypot(v.x, v.y), w = Math.abs(d.body.angularVelocity);
+    d.accum += s + w * 8;
+    if (d.accum > 4) { d.accum = 0; d.shown = ri(1, DICE[d.type].n); }
+    d.still = (s < 0.06 && w < 0.012) ? d.still + 1 : 0;
+    if (d.still >= 10) settleDie(d);
+  }
+  if (state === 'rolling') {
+    if (++rollSteps > 600) dice.forEach(d => { if (!d.settled) settleDie(d); });
+    if (dice.length && dice.every(d => d.settled)) startResolve();
+  }
+}
+
+// ---------- Resolution ----------
+function computeDamage(d) {
+  const t = DICE[d.type];
+  let v = Math.max(0, d.value + d.mod);
+  let s = String(d.value) + (d.mod > 0 ? '+' + d.mod : d.mod < 0 ? String(d.mod) : '');
+  const z = zoneAt(d.body.position);
+  if (z) { const r = ZONE_TYPES[z.type].apply(v, t.n); v = r.v; s += r.s; }
+  return { dmg:v, text:s + '=' + v, zone:z };
+}
+
+function startResolve() {
+  state = 'resolve';
+  resolveTotal = 0;
+  setLog(['DAMAGE: 0']);
+  let t = 0.25;
+  for (const d of dice) {
+    d.calc = computeDamage(d);
+    later(t, () => { d.showCalc = true; sfx('calc'); });
+    later(t + 0.5, () => {
+      flyers.push({ x0:d.body.position.x, y0:d.body.position.y, x:d.body.position.x,
+                    y:d.body.position.y, dmg:d.calc.dmg, t:0 });
+    });
+    t += 0.6;
+  }
+  later(t + 0.55, afterResolve);
+}
+
+function hitEnemy(dmg) {
+  if (dmg > 0) {
+    enemy.hp = Math.max(0, enemy.hp - dmg);
+    enemy.flash = 0.3;
+    shake(2 + Math.min(dmg / 4, 4));
+    burst(ENEMY.x, ENEMY.y, C.yellow, 10, 2.2, 0.08);
+    burst(ENEMY.x, ENEMY.y, C.red, 8, 1.8, 0.08);
+    addFloat(ENEMY.x + ri(-10, 10), ENEMY.y - 10, '-' + dmg, C.yellow);
+    sfx('hit');
+  } else {
+    addFloat(ENEMY.x, ENEMY.y - 10, 'MISS', C.gray);
+    sfx('miss');
+  }
+  resolveTotal += dmg;
+  setLog(['DAMAGE: ' + resolveTotal]);
+}
+
+function afterResolve() {
+  for (const d of dice) Composite.remove(world, d.body);
+  dice = [];
+  if (enemy.hp <= 0) {
+    enemy.dead = true;
+    burst(ENEMY.x, ENEMY.y, C.red, 30, 3, 0.06);
+    burst(ENEMY.x, ENEMY.y, C.orange, 20, 2.5, 0.06);
+    shake(6);
+    setLog(['THE GOLEM', 'IS DEFEATED!']);
+    sfx('win');
+    later(1.4, () => { state = 'win'; });
+    return;
+  }
+  state = 'enemy';
+  later(0.5, enemyAct);
+}
+
+// ---------- Enemy turn ----------
+function enemyAct() {
+  const a = pickW([['attack', 45], ['shuffle', 25], ['move', 20], ['fury', 10]], x => x[1])[0];
+  if (a === 'attack' || a === 'fury') {
+    enemy.lunge = 1;
+    setLog(a === 'fury' ? ['FURY!', 'ATTACKS AND', 'SHUFFLES!'] : ['THE GOLEM', 'ATTACKS!']);
+    later(0.2, () => hurtPlayer(ri(CONFIG.enemyDmg[0], CONFIG.enemyDmg[1])));
+  }
+  if (a === 'shuffle' || a === 'fury') {
+    if (a === 'shuffle') setLog(['THE GOLEM', 'SHUFFLES', 'THE ZONES!']);
+    later(a === 'fury' ? 0.5 : 0.1, shuffleZones);
+  }
+  if (a === 'move') {
+    setLog(['THE GOLEM', 'MOVES THE', 'OBSTACLES!']);
+    enemy.flash = 0.15;
+    later(0.1, moveObstacles);
+  }
+  later(1.4, endEnemyTurn);
+}
+function hurtPlayer(dmg) {
+  player.hp = Math.max(0, player.hp - dmg);
+  player.flash = 0.4; redFlash = 0.3;
+  shake(4);
+  addFloat(80, 124, '-' + dmg, C.red);
+  setLog([...logLines.slice(0, 2), '-' + dmg + ' HP']);
+  sfx('hurt');
+}
+function shuffleZones() {
+  zoneTrans = { old:zoneLayer, t:0 };
+  zones = genZones();
+  zoneLayer = buildZoneLayer(zones);
+  for (const z of zones) burst(z.x + z.w / 2, z.y + z.h / 2, ZONE_TYPES[z.type].light, 5, 1.2);
+  sfx('shuffle');
+}
+function moveObstacles() {
+  for (const o of obstacles) burst(o.x, o.y, C.silver, 6, 1.4);
+  genObstacles();
+  for (const o of obstacles) burst(o.x, o.y, C.white, 6, 1.4);
+  sfx('shuffle');
+}
+function endEnemyTurn() {
+  if (player.hp <= 0) { state = 'lose'; sfx('lose'); return; }
+  for (let i = 0; i < cooldowns.length; i++) if (cooldowns[i] > 0) cooldowns[i]--;
+  if (cooldowns[selected] > 0) selected = cooldowns.findIndex(c => c === 0);
+  held = HELD_HOME();
+  setLog(['YOUR TURN!', 'DRAG AND', 'THROW.']);
+  state = 'aim';
+}
+
+// ============================================================
+// EFFECTS
+// ============================================================
+function burst(x, y, col, n, sp, g = 0) {
+  for (let i = 0; i < n; i++) {
+    const a = rnd(0, Math.PI * 2), s = rnd(0.3, 1) * sp * 60;
+    particles.push({ x, y, vx:Math.cos(a) * s, vy:Math.sin(a) * s - (g ? 40 : 0),
+                     g:g * 3600, life:rnd(0.3, 0.7), col, size:Math.random() < 0.3 ? 2 : 1 });
+  }
+}
+function addFloat(x, y, s, col) { floats.push({ x, y, s, col, t:0 }); }
+
+// ============================================================
+// INPUT
+// ============================================================
+const START_BTN = { x:150, y:212, w:100, h:20 };
+const RETRY_BTN = { x:150, y:166, w:100, h:20 };
+const traySlot = i => ({ x:TRAY.x + i * TRAY.slot, y:TRAY.y, w:TRAY.slot - 1, h:TRAY.h });
+const traySlotAt = p => DICE.findIndex((_, i) => inRect(p, traySlot(i)));
+const inLaunch = p => p.x >= TB.x && p.x < TB_R && p.y >= LAUNCH_Y - 6 && p.y < TB_B + 4;
+
+function toLocal(e) {
+  const r = cv.getBoundingClientRect();
+  return { x:(e.clientX - r.left) / r.width * W, y:(e.clientY - r.top) / r.height * H };
+}
+function velFromSamples(now) {
+  const s = drag.samples.filter(q => now - q.t < 100);
+  if (s.length < 2) return { x:0, y:0 };
+  const a = s[0], b = s[s.length - 1], dt = b.t - a.t;
+  if (dt < 5) return { x:0, y:0 };
+  return { x:(b.x - a.x) / dt * STEP * CONFIG.throwK, y:(b.y - a.y) / dt * STEP * CONFIG.throwK };
+}
+function beginDrag(p, e) {
+  drag = { samples:[{ t:performance.now(), x:p.x, y:p.y }] };
+  held = clampHeld(p);
+  aimVel = { x:0, y:0 };
+  try { cv.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
+}
+
+cv.addEventListener('pointerdown', e => {
+  ensureAudio();
+  const p = toLocal(e);
+  pointer = p;
+  if (state === 'menu') { if (inRect(p, START_BTN)) { sfx('click'); newGame(); } return; }
+  if (state === 'win' || state === 'lose') { if (inRect(p, RETRY_BTN)) { sfx('click'); newGame(); } return; }
+  if (state !== 'aim' || drag) return;
+  const slot = traySlotAt(p);
+  if (slot >= 0) {
+    if (cooldowns[slot] > 0) { sfx('miss'); return; }
+    selected = slot; sfx('click');
+    beginDrag(p, e);
+    return;
+  }
+  if (inLaunch(p) || Math.hypot(p.x - held.x, p.y - held.y) < 14) beginDrag(p, e);
+});
+
+cv.addEventListener('pointermove', e => {
+  const p = toLocal(e);
+  pointer = p;
+  if (!drag) return;
+  const now = performance.now();
+  held = clampHeld(p);
+  drag.samples.push({ t:now, x:p.x, y:p.y });
+  while (drag.samples.length > 2 && now - drag.samples[0].t > 150) drag.samples.shift();
+  aimVel = velFromSamples(now);
+});
+
+function endDrag() {
+  if (!drag) return;
+  const v = velFromSamples(performance.now());
+  drag = null;
+  aimVel = { x:0, y:0 };
+  if (state === 'aim' && Math.hypot(v.x, v.y) >= CONFIG.gentle) throwDie(v.x, v.y);
+}
+cv.addEventListener('pointerup', endDrag);
+cv.addEventListener('pointercancel', endDrag);
+
+function updateCursor() {
+  let c = 'default';
+  if (state === 'menu') c = inRect(pointer, START_BTN) ? 'pointer' : 'default';
+  else if (state === 'win' || state === 'lose') c = inRect(pointer, RETRY_BTN) ? 'pointer' : 'default';
+  else if (state === 'aim') {
+    const s = traySlotAt(pointer);
+    if (drag) c = 'grabbing';
+    else if (s >= 0) c = cooldowns[s] > 0 ? 'not-allowed' : 'grab';
+    else if (inLaunch(pointer)) c = 'grab';
+  }
+  if (cv.style.cursor !== c) cv.style.cursor = c;
+}
+
+// ============================================================
+// UPDATE
+// ============================================================
+function update(dt) {
+  for (const p of particles) { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += p.g * dt; p.vx *= 0.92; if (!p.g) p.vy *= 0.92; p.life -= dt; }
+  particles = particles.filter(p => p.life > 0);
+  for (const f of floats) f.t += dt;
+  floats = floats.filter(f => f.t < 0.9);
+  for (const f of flyers) {
+    f.t += dt / 0.45;
+    const k = Math.min(1, f.t), e = k * k;
+    f.x = f.x0 + (ENEMY.x - f.x0) * e;
+    f.y = f.y0 + (ENEMY.y - f.y0) * e - Math.sin(k * Math.PI) * 20;
+    if (f.t >= 1 && !f.done) { f.done = true; hitEnemy(f.dmg); }
+  }
+  flyers = flyers.filter(f => !f.done);
+  if (enemy) {
+    enemy.flash = Math.max(0, enemy.flash - dt);
+    enemy.lunge = Math.max(0, enemy.lunge - dt / 0.4);
+    enemy.disp += (enemy.hp - enemy.disp) * Math.min(1, dt * 5);
+    if (enemy.dead) enemy.deadT += dt;
+    player.flash = Math.max(0, player.flash - dt);
+    player.disp += (player.hp - player.disp) * Math.min(1, dt * 5);
+    for (const o of obstacles) o.flash = Math.max(0, o.flash - dt);
+    for (const d of dice) d.pop = Math.max(0, d.pop - dt * 4);
+  }
+  if (zoneTrans && (zoneTrans.t += dt / 0.7) >= 1) zoneTrans = null;
+  shakeAmt = Math.max(0, shakeAmt - dt * 18);
+  redFlash = Math.max(0, redFlash - dt);
+  updateCursor();
+}
+
+// ============================================================
+// RENDER
+// ============================================================
+function drawObstacleAt(kind, x, y, flash) {
+  x = Math.round(x); y = Math.round(y);
+  const f = flash > 0;
+  switch (kind) {
+    case 'pillar':
+      pixCircle(x + 1, y + 2, 7, C.feltD);
+      pixCircle(x, y, 7, C.ink);
+      pixCircle(x, y, 6, f ? C.white : C.gray);
+      pixCircle(x - 1, y - 1, 3, C.silver);
+      break;
+    case 'bumper':
+      pixCircle(x + 1, y + 2, 8, C.feltD);
+      pixCircle(x, y, f ? 9 : 8, C.ink);
+      pixCircle(x, y, f ? 8 : 7, f ? C.white : C.orange);
+      pixCircle(x, y, 4, C.yellow);
+      pixCircle(x, y, 2, f ? C.orange : C.white);
+      break;
+    case 'rune':
+    case 'spikes': {
+      const up = kind === 'rune';
+      ctx.fillStyle = C.feltD; ctx.fillRect(x - 6, y - 5, 14, 14);
+      ctx.fillStyle = C.ink; ctx.fillRect(x - 7, y - 7, 14, 14);
+      ctx.fillStyle = f ? C.white : (up ? C.plum : C.slate); ctx.fillRect(x - 6, y - 6, 12, 12);
+      if (!up) {
+        ctx.fillStyle = C.red;
+        for (let i = -5; i <= 4; i += 3) { ctx.fillRect(x + i, y - 6, 1, 2); ctx.fillRect(x + i, y + 4, 1, 2); }
+      } else {
+        ctx.fillStyle = C.navy;
+        ctx.fillRect(x - 6, y - 6, 12, 1); ctx.fillRect(x - 6, y + 5, 12, 1);
+      }
+      tiny(up ? '+1' : '-1', x, y - 2, up ? C.cyan : C.orange);
+      break;
+    }
+    case 'crystal': {
+      const vs = [{ x, y:y - 9 }, { x:x + 7, y }, { x, y:y + 9 }, { x:x - 7, y }];
+      pixPoly(vs.map(v => ({ x:v.x + 1, y:v.y + 2 })), C.feltD);
+      pixPoly(vs, C.ink);
+      pixPoly(shrink(vs, 1), f ? C.white : C.cyan);
+      pixPoly([{ x, y:y - 6 }, { x:x + 3, y }, { x, y:y + 6 }, { x:x - 1, y }], C.sky);
+      ctx.fillStyle = C.white; ctx.fillRect(x - 2, y - 3, 1, 2);
+      break;
+    }
+  }
+}
+
+function drawDie(type, verts, cx, cy, shown, lift) {
+  const t = DICE[type];
+  if (lift) pixPoly(verts.map(v => ({ x:v.x + lift, y:v.y + lift + 1 })), 'rgba(10,12,20,0.45)');
+  const vs = lift ? verts.map(v => ({ x:v.x, y:v.y - Math.min(lift, 2) })) : verts;
+  pixPoly(vs, C.ink);
+  pixPoly(shrink(vs, 1), t.col);
+  tiny(String(shown), cx, cy - 2 - (lift ? Math.min(lift, 2) : 0), C.ink);
+}
+
+function drawBar(x, y, w, h, val, disp, max, col) {
+  ctx.fillStyle = C.ink; ctx.fillRect(x - 1, y - 1, w + 2, h + 2);
+  ctx.fillStyle = C.slate; ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = C.white; ctx.fillRect(x, y, Math.round(w * Math.max(0, disp) / max), h);
+  ctx.fillStyle = col; ctx.fillRect(x, y, Math.round(w * Math.max(0, val) / max), h);
+  ctx.fillStyle = 'rgba(255,255,255,0.25)'; ctx.fillRect(x, y, Math.round(w * Math.max(0, val) / max), 1);
+}
+
+function drawPanel() {
+  ctx.fillStyle = C.slate; ctx.fillRect(0, 0, PANEL_W, H);
+  ctx.fillStyle = C.ink; ctx.fillRect(PANEL_W, 0, 2, H);
+  ctx.fillStyle = C.gray; ctx.fillRect(PANEL_W - 1, 0, 1, H);
+
+  // Enemy
+  text('GOLEM', 5, 4, C.white);
+  text(String(Math.max(0, Math.ceil(enemy.hp))), 105, 4, C.yellow, 8, 'right');
+  drawBar(5, 14, 100, 5, enemy.hp, enemy.disp, enemy.max, C.red);
+
+  if (!enemy.dead || enemy.deadT < 1) {
+    let ox = 0, oy = Math.round(Math.sin(time * 3) * 1.5);
+    if (enemy.lunge > 0) ox = Math.round(Math.sin(enemy.lunge * Math.PI) * 10);
+    if (enemy.flash > 0) ox += ri(-2, 2);
+    const img = enemy.flash > 0 && Math.floor(enemy.flash * 20) % 2 === 0 ? SPRITE_FLASH : SPRITE;
+    ctx.save();
+    if (enemy.dead) { ctx.globalAlpha = Math.max(0, 1 - Math.floor(enemy.deadT * 6) / 6); oy += Math.round(enemy.deadT * 12); }
+    ctx.fillStyle = 'rgba(10,12,20,0.4)';
+    ctx.fillRect(ENEMY.x - 22, 84, 44, 3);
+    ctx.drawImage(img, ENEMY.x - 30 + ox, 24 + oy);
+    ctx.restore();
+  }
+
+  // Log
+  logLines.forEach((l, i) => text(l, 5, 92 + i * 10, i === 2 && l.endsWith('HP') ? C.orange : C.silver));
+
+  // Player
+  ctx.save();
+  if (player.flash > 0) ctx.translate(ri(-1, 1), 0);
+  text('YOU', 5, 124, player.flash > 0 ? C.red : C.white);
+  text(String(player.hp), 105, 124, C.lime, 8, 'right');
+  drawBar(5, 134, 100, 5, player.hp, player.disp, player.max, C.green);
+  ctx.restore();
+
+  text('THROWS', 5, 146, C.white);
+  text(String(throws), 105, 146, C.yellow, 8, 'right');
+
+  // Dice tray
+  text('DICE', 5, 164, C.silver);
+  DICE.forEach((t, i) => {
+    // outside the aim phase show what the cooldown will be on the next turn
+    const r = traySlot(i), cx = r.x + r.w / 2, cd = state === 'aim' ? cooldowns[i] : Math.max(0, cooldowns[i] - 1);
+    const sel = i === selected && state === 'aim';
+    const hov = state === 'aim' && inRect(pointer, r) && !cd;
+    ctx.fillStyle = sel ? C.yellow : C.ink; ctx.fillRect(r.x, r.y, r.w, r.h);
+    ctx.fillStyle = hov ? C.gray : C.navy; ctx.fillRect(r.x + 1, r.y + 1, r.w - 2, r.h - 2);
+    const vs = tplAt(i, cx, r.y + 10, 0.75);
+    pixPoly(vs, C.ink); pixPoly(shrink(vs, 1), t.col);
+    tiny(String(t.n), cx, r.y + 19, sel ? C.yellow : C.silver);
+    if (cd > 0) {
+      ctx.fillStyle = 'rgba(13,14,24,0.75)'; ctx.fillRect(r.x + 1, r.y + 1, r.w - 2, r.h - 2);
+      text(String(cd), cx, r.y + 9, C.orange, 8, 'center');
+    }
+  });
+  const st = DICE[selected] || DICE[1];
+  text(st.name.toUpperCase(), 5, 208, st.col);
+  text('CD ' + st.cd, 105, 208, C.silver, 8, 'right');
+  tiny('1-' + st.n, 55, 222, C.gray);
+}
+
+function drawTable() {
+  ctx.fillStyle = C.woodD; ctx.fillRect(TB.x - 5, TB.y - 5, TB.w + 10, TB.h + 10);
+  ctx.fillStyle = C.wood; ctx.fillRect(TB.x - 4, TB.y - 4, TB.w + 8, TB.h + 8);
+  ctx.fillStyle = C.orange;
+  for (let x = TB.x; x < TB_R; x += 16) ctx.fillRect(x, TB.y - 3, 6, 1);
+  ctx.fillStyle = C.woodD; ctx.fillRect(TB.x - 1, TB.y - 1, TB.w + 2, TB.h + 2);
+
+  if (zoneTrans) {
+    ctx.drawImage(zoneTrans.old, 0, 0);
+    ctx.save();
+    ctx.globalAlpha = Math.min(1, Math.floor(zoneTrans.t * 5) / 4);
+    ctx.drawImage(zoneLayer, 0, 0);
+    ctx.restore();
+  } else ctx.drawImage(zoneLayer, 0, 0);
+
+  for (const o of obstacles) if (!o.used) drawObstacleAt(o.kind, o.x, o.y, o.flash);
+
+  for (const d of dice) {
+    const s = 1 + d.pop * 0.3, p = d.body.position;
+    const vs = d.body.vertices.map(v => ({ x:p.x + (v.x - p.x) * s, y:p.y + (v.y - p.y) * s }));
+    const moving = !d.settled;
+    drawDie(d.type, vs, p.x, p.y, d.shown, moving ? 1 : 0);
+  }
+  for (const d of dice) {
+    if (!d.showCalc) continue;
+    const p = d.body.position, s = d.calc.text, w = s.length * 8 + 4;
+    const x = clamp(Math.round(p.x - w / 2), TB.x + 1, TB_R - w - 1);
+    const y = p.y - 24 < TB.y ? Math.round(p.y + 13) : Math.round(p.y - 24);
+    const col = d.calc.zone ? ZONE_TYPES[d.calc.zone.type].light : C.white;
+    ctx.fillStyle = col; ctx.fillRect(x - 1, y - 1, w + 2, 12);
+    ctx.fillStyle = C.ink; ctx.fillRect(x, y, w, 10);
+    text(s, x + 2, y + 1, d.calc.dmg > 0 ? C.white : C.gray, 8, 'left', false);
+  }
+
+  if (state === 'aim') {
+    const lift = drag ? 4 : 1;
+    const bob = drag ? 0 : Math.round(Math.sin(time * 4));
+    if (drag) {   // power / direction indicator
+      const sp = Math.hypot(aimVel.x, aimVel.y);
+      if (sp > 0.5) {
+        const k = Math.min(sp, CONFIG.maxSpeed) / CONFIG.maxSpeed;
+        const col = sp < CONFIG.gentle ? C.gray : k < 0.5 ? C.lime : k < 0.85 ? C.yellow : C.red;
+        const ux = aimVel.x / sp, uy = aimVel.y / sp, len = 8 + k * 40;
+        ctx.fillStyle = col;
+        for (let i = 12; i < len; i += 3) ctx.fillRect(Math.round(held.x + ux * i), Math.round(held.y + uy * i), 2, 2);
+      }
+    }
+    drawDie(selected, tplAt(selected, held.x, held.y + bob), held.x, held.y + bob, DICE[selected].n, lift);
+  }
+}
+
+function drawFx() {
+  for (const p of particles) {
+    ctx.fillStyle = p.col;
+    ctx.fillRect(Math.round(p.x), Math.round(p.y), p.size, p.size);
+  }
+  for (const f of flyers) {
+    pixCircle(f.x, f.y, 6, C.ink);
+    pixCircle(f.x, f.y, 5, f.dmg > 0 ? C.yellow : C.gray);
+    tiny(String(f.dmg), f.x, f.y - 2, C.ink);
+  }
+  for (const f of floats) {
+    const y = f.y - f.t * 18;
+    if (f.t > 0.6 && Math.floor(f.t * 20) % 2) continue;
+    text(f.s, f.x, y, f.col, 8, 'center');
+  }
+}
+
+function drawButton(r, label) {
+  const hov = inRect(pointer, r);
+  ctx.fillStyle = C.ink; ctx.fillRect(r.x, r.y + 2, r.w, r.h);
+  ctx.fillStyle = hov ? C.yellow : C.orange; ctx.fillRect(r.x, r.y, r.w, r.h);
+  ctx.fillStyle = hov ? C.white : C.yellow; ctx.fillRect(r.x, r.y, r.w, 2);
+  text(label, r.x + r.w / 2, r.y + 6, C.ink, 8, 'center', false);
+}
+
+function drawMenu() {
+  ctx.fillStyle = C.ink; ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = C.slate;
+  for (let i = 0; i < 40; i++) ctx.fillRect((i * 97) % W, (i * 53 + Math.floor(time * 6)) % H, 1, 1);
+  const bob = Math.round(Math.sin(time * 2) * 2);
+  text('DICE BRAWL', W / 2 + 1, 10 + bob, C.red, 16, 'center');
+  text('DICE BRAWL', W / 2, 9 + bob, C.yellow, 16, 'center', false);
+  text('Defeat the Golem in as', W / 2, 32, C.silver, 8, 'center');
+  text('few throws as possible!', W / 2, 42, C.silver, 8, 'center');
+
+  text('ZONES (where the die stops)', 12, 58, C.white);
+  Object.values(ZONE_TYPES).forEach((z, i) => {
+    const x = 12 + (i % 2) * 192, y = 70 + Math.floor(i / 2) * 12;
+    ctx.fillStyle = z.light; ctx.fillRect(x, y, 10, 8);
+    ctx.fillStyle = z.fill; ctx.fillRect(x + 1, y + 1, 8, 6);
+    text(z.label, x + 14, y, z.light);
+    text(z.desc, x + 62, y, C.silver);
+  });
+
+  text('OBSTACLES (when hit)', 12, 110, C.white);
+  ['bumper', 'rune', 'spikes', 'crystal', 'pillar'].forEach((k, i) => {
+    const x = 12 + (i % 2) * 192, y = 122 + Math.floor(i / 2) * 18;
+    drawObstacleAt(k, x + 7, y + 4, 0);
+    text(OBS_DESC[k], x + 20, y, C.silver);
+  });
+
+  text('Pick a die, drag it and', W / 2, 180, C.lime, 8, 'center');
+  text('release it with a flick!', W / 2, 192, C.lime, 8, 'center');
+  drawButton(START_BTN, 'START');
+}
+
+function drawEnd() {
+  ctx.fillStyle = 'rgba(13,14,24,0.78)'; ctx.fillRect(0, 0, W, H);
+  const bx = 100, by = 44, bw = 200, bh = 150;
+  ctx.fillStyle = C.ink; ctx.fillRect(bx - 2, by - 2, bw + 4, bh + 4);
+  ctx.fillStyle = C.slate; ctx.fillRect(bx, by, bw, bh);
+  ctx.fillStyle = C.gray; ctx.fillRect(bx, by, bw, 2);
+  const win = state === 'win';
+  text(win ? 'VICTORY!' : 'DEFEAT', W / 2, by + 12, win ? C.yellow : C.red, 16, 'center');
+  text('Throws: ' + throws, W / 2, by + 38, C.white, 8, 'center');
+  if (win) {
+    const stars = throws <= CONFIG.stars[0] ? 3 : throws <= CONFIG.stars[1] ? 2 : 1;
+    for (let i = 0; i < 3; i++) drawStar(W / 2 - 34 + i * 24, by + 54, i < stars ? C.yellow : C.ink);
+    text(stars === 3 ? 'Perfect!' : stars === 2 ? 'Great job' : 'You made it', W / 2, by + 80, C.silver, 8, 'center');
+  } else {
+    text('Golem HP: ' + enemy.hp + '/' + enemy.max, W / 2, by + 56, C.silver, 8, 'center');
+    text('Try aiming better', W / 2, by + 74, C.silver, 8, 'center');
+    text('at the zones!', W / 2, by + 84, C.silver, 8, 'center');
+  }
+  drawButton(RETRY_BTN, 'RETRY');
+}
+
+function draw() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = C.ink; ctx.fillRect(0, 0, W, H);
+  if (state === 'menu') { drawMenu(); return; }
+  const a = Math.round(shakeAmt);
+  ctx.save();
+  if (a) ctx.translate(ri(-a, a), ri(-a, a));
+  drawTable();
+  drawPanel();
+  drawFx();
+  ctx.restore();
+  if (redFlash > 0) { ctx.fillStyle = 'rgba(177,62,83,' + (redFlash * 1.2).toFixed(2) + ')'; ctx.fillRect(0, 0, W, H); }
+  if (state === 'win' || state === 'lose') drawEnd();
+}
+
+// ============================================================
+// MAIN LOOP
+// ============================================================
+let last = performance.now(), acc = 0;
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000);
+  last = now; time += dt;
+  if (tasks.length) {
+    const due = tasks.filter(t => t.at <= time);
+    tasks = tasks.filter(t => t.at > time);
+    due.forEach(t => t.fn());
+  }
+  acc += dt;
+  let n = 0;
+  while (acc >= STEP / 1000 && n < 4) { physicsStep(); acc -= STEP / 1000; n++; }
+  if (n === 4) acc = 0;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+if (document.fonts && document.fonts.load) {
+  document.fonts.load('8px "Press Start 2P"').then(() => {
+    fontReady = true;
+    if (zones) zoneLayer = buildZoneLayer(zones);
+  }).catch(() => {});
+}
+requestAnimationFrame(frame);
+})();
+</script>
